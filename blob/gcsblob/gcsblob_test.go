@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/storage"
+	"cloud.google.com/go/storage/experimental"
 	"github.com/google/go-cmp/cmp"
 	"gocloud.dev/blob"
 	"gocloud.dev/blob/driver"
@@ -38,6 +39,7 @@ import (
 	"gocloud.dev/gcp"
 	"gocloud.dev/internal/testing/setup"
 	"google.golang.org/api/googleapi"
+	"google.golang.org/api/option"
 )
 
 const (
@@ -170,9 +172,118 @@ func TestOpenBucketGRPC(t *testing.T) {
 	}
 }
 
+// grpcBucketEnv names a real bucket to run the gRPC conformance tests against.
+const grpcBucketEnv = "GCSBLOB_GRPC_TEST_BUCKET"
+
+// grpcHarness runs the conformance tests over the Cloud Storage gRPC API
+// against a real bucket. Unlike newHarness it does not record or replay, so it
+// skips unless grpcBucketEnv is set; see TestConformanceGRPC for why.
+type grpcHarness struct {
+	client  *storage.Client
+	cleanup func()
+	bucket  string
+}
+
+func newGRPCHarness(zonal bool) func(ctx context.Context, t *testing.T) (drivertest.Harness, error) {
+	return func(ctx context.Context, t *testing.T) (drivertest.Harness, error) {
+		t.Helper()
+		bkt := os.Getenv(grpcBucketEnv)
+		if bkt == "" {
+			t.Skipf("%s not set", grpcBucketEnv)
+		}
+		creds, err := gcp.DefaultCredentials(ctx)
+		if err != nil {
+			return nil, err
+		}
+		var opts []option.ClientOption
+		if zonal {
+			opts = append(opts, experimental.WithZonalBucketAPIs())
+		}
+		client, cleanup, err := DialGRPC(ctx, gcp.CredentialsTokenSource(creds), opts...)
+		if err != nil {
+			return nil, err
+		}
+		return &grpcHarness{client: client, cleanup: cleanup, bucket: bkt}, nil
+	}
+}
+
+func (h *grpcHarness) MakeDriver(ctx context.Context) (driver.Bucket, error) {
+	return openBucket(ctx, nil, h.bucket, &Options{Client: h.client})
+}
+
+func (h *grpcHarness) MakeDriverForNonexistentBucket(ctx context.Context) (driver.Bucket, error) {
+	return openBucket(ctx, nil, "bucket-does-not-exist", &Options{Client: h.client})
+}
+
 // HTTPClient returns nil: without a GoogleAccessID and a signer, SignedURL
 // reports Unimplemented and drivertest skips the checks that would need this.
 // SignedURL is signed client-side and is unaffected by the transport.
+func (h *grpcHarness) HTTPClient() *http.Client { return nil }
+
+func (h *grpcHarness) Close() { h.cleanup() }
+
+// TestConformanceGRPC runs the conformance suite over the gRPC API.
+//
+// It talks to a real bucket rather than a recorded one, so it skips unless
+// GCSBLOB_GRPC_TEST_BUCKET names a bucket you can write to:
+//
+//	GCSBLOB_GRPC_TEST_BUCKET=my-bucket go test ./blob/gcsblob/ -run TestConformanceGRPC
+//
+// It cannot yet use the record/replay harness that TestConformance uses.
+// cloud.google.com/go/storage reads objects with a zero-copy codec, installed
+// unconditionally as grpc.ForceCodecV2(bytesCodecReadObject{}), so RecvMsg is
+// handed a *mem.BufferSlice rather than a proto.Message. Released versions of
+// grpcreplay assume every message is a proto.Message and panic on the type
+// assertion in message.set, so recording any gRPC read aborts the test binary.
+//
+// https://github.com/google/go-replayers/pull/70 fixes that by recording such
+// messages as raw wire bytes. With it applied, storage writes, full reads,
+// range reads and unary calls all record and replay correctly. Once it is
+// released and go.mod picks it up, this test should move to the record/replay
+// harness and stop needing a real bucket.
+func TestConformanceGRPC(t *testing.T) {
+	drivertest.RunConformanceTests(t, newGRPCHarness(false), []drivertest.AsTest{verifyContentLanguage{}})
+}
+
+// TestConformanceGRPCZonal is TestConformanceGRPC with the zonal bucket APIs
+// enabled, which is what a Rapid Storage bucket requires.
+//
+// It is skipped unconditionally. Against a Rapid Storage bucket 55 checks pass
+// and 33 fail, and every failure is a Cloud Storage restriction rather than a
+// driver bug. drivertest cannot currently express "this driver does not support
+// X": the only opt-out is returning gcerrors.Unimplemented, and every place
+// that honors it guards SignedURL, while testCopy treats any error from Copy as
+// a failure.
+//
+// Once specific conformance tests can be disabled, these are the ones to
+// disable, and why:
+//
+//   - TestCopy, TestKeys and TestAs. Rapid Storage does not support object
+//     rewrite, so Copy fails with "Rapid storage class objects do not support
+//     rewrite". Only TestCopy is about copying; TestKeys and TestAs copy
+//     incidentally, and TestKeys accounts for 19 of the 33 failures because it
+//     copies once per key it exercises.
+//     https://docs.cloud.google.com/storage/docs/rapid/rapid-bucket
+//
+//   - TestListDelimiters/backslash and TestListDelimiters/abc. Rapid Storage
+//     requires a hierarchical namespace, and such buckets only support "/" as a
+//     delimiter; anything else fails with "Invalid argument".
+//     TestListDelimiters/fwdslash passes.
+//
+//   - TestWrite/Content_md5_match, TestWrite/Content_md5_did_not_match,_blob_existed,
+//     TestWrite/a_small_text_file_gets_a_ContentType and
+//     TestWrite/write_with_explicit_ContentType_overrides_discovery. These
+//     rewrite one object in a tight loop and hit "exceeded the rate limit for
+//     object mutation operations". That is the general Cloud Storage
+//     per-object mutation limit rather than a Rapid Storage restriction, and it
+//     only appears when the client is close enough to the bucket to trip it:
+//     these four failed from a VM in the bucket's zone but not from a laptop.
+//     They may not need a permanent skip.
+func TestConformanceGRPCZonal(t *testing.T) {
+	t.Skip("Rapid Storage does not support object rewrite or non-\"/\" list delimiters; see the comment above for the tests that need to be skipped")
+	drivertest.RunConformanceTests(t, newGRPCHarness(true), []drivertest.AsTest{verifyContentLanguage{}})
+}
+
 func BenchmarkGcsblob(b *testing.B) {
 	ctx := context.Background()
 	creds, err := gcp.DefaultCredentials(ctx)
